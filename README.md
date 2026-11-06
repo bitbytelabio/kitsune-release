@@ -22,6 +22,16 @@ curl http://127.0.0.1:8901/v1/me
 
 Server chỉ mở cổng trên `127.0.0.1:8901`. Muốn dùng từ máy khác, hãy đặt một reverse proxy có TLS phía trước, ví dụ Caddy hoặc Cloudflare Tunnel.
 
+## Tạo tài khoản đầu tiên
+
+Server chưa có ai nên cần tự tạo lời mời đầu tiên:
+
+```sh
+docker compose exec server kitsune-server invite --email you@example.com --org "My team"
+```
+
+Lệnh in ra một mã mời. Trong app, chọn có lời mời rồi nhập địa chỉ server và mã này.
+
 ## Cập nhật
 
 ```sh
