@@ -1,0 +1,54 @@
+# One command to a working team server.
+#
+#   cp .env.example .env   # set KITSUNE_DB_PASSWORD
+#   docker compose up -d
+#
+# The server is deliberately dumb: it never generates a fingerprint, never
+# decrypts a profile, and never proxies browser traffic. That is why a 1 vCPU
+# box carries a team — and why compromising it yields metadata, not accounts.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # The administrator. The server connects as its own role, which the
+      # script below creates: this one would bypass row security.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${KITSUNE_DB_PASSWORD:?set KITSUNE_DB_PASSWORD in .env}
+      KITSUNE_DB_PASSWORD: ${KITSUNE_DB_PASSWORD}
+    volumes:
+      - kitsune-db:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # The server applies migrations on boot, so it must not start against a
+      # database that is still initialising.
+      test: ["CMD-SHELL", "pg_isready -U kitsune -d kitsune"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  server:
+    image: ghcr.io/bitbytelabio/kitsune-server:${KITSUNE_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://kitsune:${KITSUNE_DB_PASSWORD}@db:5432/kitsune
+      BIND: 0.0.0.0:8901
+      # Mail for confirming invited addresses. Empty: off.
+      KITSUNE_SMTP_URL: ${KITSUNE_SMTP_URL:-}
+      KITSUNE_MAIL_FROM: ${KITSUNE_MAIL_FROM:-}
+    # Bound to loopback on purpose: put a reverse proxy in front for TLS.
+    # Session tokens over plain HTTP on a public interface would be a gift.
+    ports:
+      - "127.0.0.1:8901:8901"
+    # The profiles themselves. Without a volume they lived in the container and
+    # went with it at the first rebuild, leaving a database that lists versions
+    # whose bytes are gone. Back this up together with kitsune-db.
+    volumes:
+      - kitsune-bundles:/var/lib/kitsune/bundles
+
+volumes:
+  kitsune-db:
+  kitsune-bundles:
