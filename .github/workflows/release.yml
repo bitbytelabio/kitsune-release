@@ -1,0 +1,246 @@
+# Build a tag of the private source and publish the binaries here.
+#
+# THIS REPOSITORY IS PUBLIC AND THE SOURCE IS NOT. Its logs and artifacts can be
+# read by anyone, and a pull request from a fork can read its caches, so:
+#
+#   - nothing but a person with write access can start this;
+#   - the secrets live in the environment `release`, which only main can use;
+#   - build output goes to a file, because compiler errors quote the source. On
+#     failure only the step and the error headings are shown; for the rest, run
+#     the same script locally;
+#   - no build cache, and no upload-artifact: `target/` is compiled source, and
+#     finished files go straight into a draft release, which is not public.
+#
+# Start it with tools/release/cut.sh in kitsune-browser.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag in kitsune-browser, like v0.6.0
+        required: true
+        type: string
+      server:
+        description: Also build the server image
+        type: boolean
+        default: true
+      notes:
+        description: Release notes
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: bitbytelabio/kitsune-browser
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Only a version tag
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$REF is not vX.Y.Z"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: The tag and the source agree
+        id: version
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' source/Cargo.toml | head -1)
+          [ "v$version" = "$REF" ] || { echo "::error::Cargo.toml says $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          # A draft left by a failed run is reused; a published release is not.
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            [ "$draft" = true ] || { echo "::error::$TAG is already published"; exit 1; }
+          else
+            gh release create "$TAG" --draft --title "Kitsune ${TAG#v}" --notes "$NOTES" --target main
+          fi
+
+  desktop:
+    needs: prepare
+    runs-on: macos-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Temporary keychain
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(openssl rand -hex 24)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf %s "$MACOS_CERT_P12" | base64 -d > "$RUNNER_TEMP/release.p12"
+          security import "$RUNNER_TEMP/release.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/release.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+      - name: Build
+        working-directory: source
+        env:
+          APPLE_SIGNING_IDENTITY: Kitsune Release
+          KITSUNE_RELEASE_OUT: ${{ runner.temp }}/out
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          if ! { (cd apps/desktop && bun install --frozen-lockfile) && tools/release/build-macos.sh; } > "$log" 2>&1; then
+            grep -E '^(==>|!!|error(\[|:)|failed to|.*beforeBuildCommand failed)' "$log" | tail -40 || true
+            echo "::error::Build failed. The full log stays private; run tools/release/build-macos.sh locally."
+            exit 1
+          fi
+          grep -E '^==>' "$log"
+      - name: Upload to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/out/* --clobber
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/release.keychain-db" || true
+
+  server:
+    needs: prepare
+    if: inputs.server
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Sign in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf %s "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Build and push
+        working-directory: source
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          log="$RUNNER_TEMP/server.log"
+          if ! tools/release/publish-server.sh --arch "$ARCH" "$VERSION" > "$log" 2>&1; then
+            grep -E '(^|\s)(error(\[|:)|ERROR:)' "$log" | sed -E 's/^#[0-9]+ [0-9.]+ //' | tail -40 || true
+            echo "::error::Image build failed. The full log stays private; run tools/release/publish-server.sh locally."
+            exit 1
+          fi
+
+  server-merge:
+    needs: [prepare, server]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Sign in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf %s "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Join the architectures
+        working-directory: source
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: tools/release/publish-server.sh --merge "$VERSION"
+
+  publish:
+    needs: [prepare, desktop, server-merge]
+    # server-merge is skipped when no image was asked for, and that must not
+    # stop the app from being published.
+    if: >-
+      !cancelled() && needs.desktop.result == 'success' &&
+      (needs.server-merge.result == 'success' || !inputs.server)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: The updater manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          archive="Kitsune_${VERSION}_aarch64.app.tar.gz"
+          gh release download "$TAG" --pattern "$archive.sig" --output archive.sig
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat archive.sig)" \
+            --arg url "https://github.com/$GH_REPO/releases/download/$TAG/$archive" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"darwin-aarch64": {signature: $signature, url: $url}}}' > latest.json
+          gh release upload "$TAG" latest.json --clobber
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: gh release edit "$TAG" --draft=false --latest
