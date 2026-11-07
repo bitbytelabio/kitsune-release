@@ -47,4 +47,10 @@ Dữ liệu nằm trong hai volume `kitsune-db` và `kitsune-bundles`. Hãy sao 
 
 ## App desktop
 
-Chưa có bản tải về. Khi có, file DMG cho macOS Apple Silicon sẽ nằm ở mục [Releases](https://github.com/bitbytelabio/kitsune-release/releases).
+Tải file DMG cho macOS Apple Silicon ở mục [Releases](https://github.com/bitbytelabio/kitsune-release/releases), mở ra rồi kéo Kitsune vào Applications.
+
+App được ký bằng chứng chỉ riêng chứ không phải của Apple, nên lần mở đầu tiên macOS sẽ chặn lại. Mở System Settings → Privacy & Security, kéo xuống và chọn **Open Anyway**. Việc này chỉ cần làm một lần.
+
+Sau đó app tự tải bản mới. Khi bản mới sẵn sàng, nút **Restart to update** hiện ở đầu cửa sổ. Hãy đóng các profile đang mở trước khi bấm.
+
+Khi có bản Chrome hoặc Firefox mới, profile sẽ có dấu thông báo ở cạnh tên. Mỗi profile tự giữ bản đang dùng và chỉ đổi khi bạn chọn **Update** trong menu của dòng đó.

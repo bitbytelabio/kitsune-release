@@ -1,0 +1,136 @@
+# Mirror one engine build here and add it to the signed list the agent reads.
+#
+# A hosted runner cannot build Chromium, so this only takes a build that already
+# exists at `url`. Its file is checked against `sha256` before anything happens,
+# because the signature on the list is what every Mac trusts from then on.
+#
+# Every release here says --latest=false: the application finds its own updates
+# at releases/latest, and an engine marked latest would hide them.
+
+name: Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: Engine
+        required: true
+        type: choice
+        options: [ginko, kitsunebi]
+      version:
+        description: Version, like 156.0.8080.1
+        required: true
+        type: string
+      url:
+        description: Where the zip is now
+        required: true
+        type: string
+      sha256:
+        description: SHA-256 of the zip
+        required: true
+        type: string
+      strip_prefix:
+        description: The single top-level directory in the zip, if it has one
+        type: string
+        default: ""
+      executable:
+        description: The executable inside the install directory
+        required: true
+        type: string
+      min_app:
+        description: The oldest Kitsune that can run it, like 0.6.0
+        type: string
+        default: ""
+      notes:
+        description: What changed
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engines
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  PLATFORM: darwin-aarch64
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check the inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          MIN_APP: ${{ inputs.min_app }}
+          SHA: ${{ inputs.sha256 }}
+          URL: ${{ inputs.url }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || { echo "::error::bad version"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
+          [[ "$URL" == https://* ]] || { echo "::error::the url must be https"; exit 1; }
+          [[ -z "$MIN_APP" || "$MIN_APP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad min_app"; exit 1; }
+      - name: Fetch and check
+        env:
+          URL: ${{ inputs.url }}
+          SHA: ${{ inputs.sha256 }}
+          ENGINE: ${{ inputs.engine }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          file="$ENGINE-$VERSION-$PLATFORM.zip"
+          curl -fsSL --retry 3 -o "$file" "$URL"
+          echo "$SHA  $file" | sha256sum -c -
+          echo "FILE=$file" >> "$GITHUB_ENV"
+      - name: Upload the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE: ${{ inputs.engine }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="engine-$ENGINE-$VERSION"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --latest=false --title "$ENGINE $VERSION" --notes "Mirrored engine build." --target main
+          gh release upload "$tag" "$FILE" --clobber
+          echo "ASSET=https://github.com/$GH_REPO/releases/download/$tag/$FILE" >> "$GITHUB_ENV"
+      - name: Add it to the list
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE: ${{ inputs.engine }}
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.sha256 }}
+          STRIP: ${{ inputs.strip_prefix }}
+          EXECUTABLE: ${{ inputs.executable }}
+          MIN_APP: ${{ inputs.min_app }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          gh release view engines >/dev/null 2>&1 || \
+            gh release create engines --latest=false --title "Engine list" --notes "The signed list of engine builds." --target main
+          gh release download engines --pattern engines.json 2>/dev/null || echo '{"serial":0,"engines":{}}' > engines.json
+          jq \
+            --arg engine "$ENGINE" --arg platform "$PLATFORM" \
+            --arg version "$VERSION" --arg url "$ASSET" --arg sha "$SHA" \
+            --arg strip "$STRIP" --arg executable "$EXECUTABLE" --arg min "$MIN_APP" --arg notes "$NOTES" \
+            '.serial += 1
+             | .engines[$engine][$platform] =
+               ([{version: $version, url: $url, sha256: $sha, executable: $executable}
+                 + (if $strip == "" then {} else {strip_prefix: $strip} end)
+                 + (if $min == "" then {} else {min_app: $min} end)
+                 + (if $notes == "" then {} else {notes: $notes} end)]
+                + ((.engines[$engine][$platform] // []) | map(select(.version != $version))))' \
+            engines.json > next.json
+          mv next.json engines.json
+          cat engines.json
+      - name: Sign the list
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx --yes @tauri-apps/cli@2.12.4 signer sign engines.json
+      - name: Publish the list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload engines engines.json engines.json.sig --clobber
