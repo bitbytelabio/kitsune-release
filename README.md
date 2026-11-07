@@ -39,7 +39,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Muốn giữ một phiên bản cố định, đặt `KITSUNE_VERSION=0.5.1` trong `.env`.
+Muốn giữ một phiên bản cố định, đặt `KITSUNE_VERSION=0.6.0` trong `.env`.
 
 ## Sao lưu
 
