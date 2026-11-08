@@ -1,0 +1,11 @@
+# The workflows pin every action to a commit. This keeps those pins current, one
+# pull request a week at most, and check.yml lints each one.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
