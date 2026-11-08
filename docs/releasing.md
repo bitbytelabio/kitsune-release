@@ -85,7 +85,7 @@ To sign git tags, use your own key on your machine (`git tag -s`, GPG or SSH). T
 
 ## Not yet: ginko-core
 
-`engine.yml` only takes a public `https` URL. The ginko-core release workflow makes a draft release in its own private repository, which this workflow cannot download from. The next step there:
+ginko-core is private, and its builds will come from a self-hosted machine rather than GitHub-hosted Actions. `engine.yml` only takes a public `https` URL, so a ginko build has to be reachable at one before it can be mirrored. That route is still to be decided. Two things to settle then:
 
-- **A new source in `engine.yml`:** download a ginko-core release's `macos-arm64` zip and `.manifest.json` with a read-only token, verify its attestation, and take `sha256` and `strip_prefix` from the manifest. One caveat: GitHub only offers attestations in private repositories on GitHub Enterprise Cloud.
-- **Fix the Python launcher in ginko-core.** `python/src/ginko/binary.py` expects `v<package_version>` tags here, which clash with the app's tags, and falls back to `releases/latest`, which is the app. Change it to the `engine-ginko-<chromium version>` tags, and update the `--repo` in its docs and tests to match.
+- **The trust in a mirrored ginko build is the `sha256` you pass.** ginko-core can't attest its own builds: GitHub offers attestations in private repositories only on GitHub Enterprise Cloud, and only from Actions. Take the `sha256` from the build's `.manifest.json`, not from the downloaded file.
+- **Fix the Python launcher in ginko-core.** `python/src/ginko/binary.py` expects `v<package_version>` tags here, which clash with the app's tags, and falls back to `releases/latest`, which is the app. Change it to the `engine-ginko-<chromium version>` tags. Its docs, tests and `.github/release/artifact-policy.json` also promise a `gh attestation verify` that ginko-core can't provide, so those need changing too.
