@@ -6,6 +6,9 @@
 #
 # Every release here says --latest=false: the application finds its own updates
 # at releases/latest, and an engine marked latest would hide them.
+#
+# The list itself is edited by scripts/engine-list.sh, which check.yml tests on
+# every pull request. See docs/releasing.md.
 
 name: Engine
 
@@ -63,18 +66,22 @@ jobs:
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check the inputs
         env:
+          ENGINE: ${{ inputs.engine }}
           VERSION: ${{ inputs.version }}
-          MIN_APP: ${{ inputs.min_app }}
-          SHA: ${{ inputs.sha256 }}
           URL: ${{ inputs.url }}
-        run: |
-          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || { echo "::error::bad version"; exit 1; }
-          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256"; exit 1; }
-          [[ "$URL" == https://* ]] || { echo "::error::the url must be https"; exit 1; }
-          [[ -z "$MIN_APP" || "$MIN_APP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad min_app"; exit 1; }
+          SHA: ${{ inputs.sha256 }}
+          STRIP: ${{ inputs.strip_prefix }}
+          EXECUTABLE: ${{ inputs.executable }}
+          MIN_APP: ${{ inputs.min_app }}
+        run: scripts/engine-list.sh validate
       - name: Fetch and check
         env:
           URL: ${{ inputs.url }}
@@ -86,6 +93,12 @@ jobs:
           curl -fsSL --retry 3 -o "$file" "$URL"
           echo "$SHA  $file" | sha256sum -c -
           echo "FILE=$file" >> "$GITHUB_ENV"
+      # Provenance of the mirror: that this workflow, at this commit, published
+      # these bytes. What vouches for the bytes themselves is the sha256 above.
+      - name: Attest the build
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.FILE }}
       - name: Upload the build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -102,6 +115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ENGINE: ${{ inputs.engine }}
           VERSION: ${{ inputs.version }}
+          URL: ${{ env.ASSET }}
           SHA: ${{ inputs.sha256 }}
           STRIP: ${{ inputs.strip_prefix }}
           EXECUTABLE: ${{ inputs.executable }}
@@ -111,19 +125,7 @@ jobs:
           gh release view engines >/dev/null 2>&1 || \
             gh release create engines --latest=false --title "Engine list" --notes "The signed list of engine builds." --target main
           gh release download engines --pattern engines.json 2>/dev/null || echo '{"serial":0,"engines":{}}' > engines.json
-          jq \
-            --arg engine "$ENGINE" --arg platform "$PLATFORM" \
-            --arg version "$VERSION" --arg url "$ASSET" --arg sha "$SHA" \
-            --arg strip "$STRIP" --arg executable "$EXECUTABLE" --arg min "$MIN_APP" --arg notes "$NOTES" \
-            '.serial += 1
-             | .engines[$engine][$platform] =
-               ([{version: $version, url: $url, sha256: $sha, executable: $executable}
-                 + (if $strip == "" then {} else {strip_prefix: $strip} end)
-                 + (if $min == "" then {} else {min_app: $min} end)
-                 + (if $notes == "" then {} else {notes: $notes} end)]
-                + ((.engines[$engine][$platform] // []) | map(select(.version != $version))))' \
-            engines.json > next.json
-          mv next.json engines.json
+          scripts/engine-list.sh add engines.json
           cat engines.json
       - name: Sign the list
         env:
