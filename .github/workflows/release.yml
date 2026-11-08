@@ -11,6 +11,10 @@
 #   - no build cache, and no upload-artifact: `target/` is compiled source, and
 #     finished files go straight into a draft release, which is not public.
 #
+# Every file it publishes, and the server image, gets a build provenance
+# attestation (Sigstore, keyless), and the release a SHA256SUMS. How to check
+# them is in README.md; how the whole thing fits together, in docs/releasing.md.
+#
 # Start it with tools/release/cut.sh in kitsune-browser.
 
 name: Release
@@ -90,6 +94,8 @@ jobs:
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -117,6 +123,8 @@ jobs:
           security import "$RUNNER_TEMP/release.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
           rm "$RUNNER_TEMP/release.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # Split on purpose: one keychain path per line, none with a space.
+          # shellcheck disable=SC2046
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
       - name: Build
         working-directory: source
@@ -133,6 +141,12 @@ jobs:
             exit 1
           fi
           grep -E '^==>' "$log"
+      - name: Attest the app
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/out/*.dmg
+            ${{ runner.temp }}/out/*.app.tar.gz
       - name: Upload to the draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,8 +170,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
-      contents: read
+      contents: write
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -183,6 +199,36 @@ jobs:
             echo "::error::Image build failed. The full log stays private; run tools/release/publish-server.sh locally."
             exit 1
           fi
+      # The same binary without docker, for deploy/server-install.sh in
+      # kitsune-browser: it looks for exactly these names, and builds from source
+      # on the server when they are missing. Taken out of the image just pushed,
+      # so the two cannot differ. Built on Debian bookworm: glibc 2.36 or newer.
+      - name: The binary on its own
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          case "$ARCH" in amd64) karch=x86_64 ;; arm64) karch=aarch64 ;; *) exit 1 ;; esac
+          out="$RUNNER_TEMP/server-binary"
+          mkdir -p "$out"
+          id=$(docker create --platform "linux/$ARCH" "ghcr.io/bitbytelabio/kitsune-server:$VERSION-$ARCH")
+          docker cp "$id:/usr/local/bin/kitsune-server" "$out/kitsune-server"
+          docker rm "$id" >/dev/null
+          says=$("$out/kitsune-server" --version)
+          [ "$says" = "kitsune-server $VERSION" ] || { echo "::error::the binary says: $says"; exit 1; }
+          name="kitsune-server-$VERSION-linux-$karch.tar.gz"
+          tar -czf "$out/$name" -C "$out" kitsune-server
+          (cd "$out" && sha256sum "$name" > "$name.sha256")
+          echo "SERVER_TAR=$out/$name" >> "$GITHUB_ENV"
+      - name: Attest the binary
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.SERVER_TAR }}
+      - name: Upload the binary to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: gh release upload "$TAG" "$SERVER_TAR" "$SERVER_TAR.sha256" --clobber
 
   server-merge:
     needs: [prepare, server]
@@ -191,6 +237,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -209,6 +257,23 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: tools/release/publish-server.sh --merge "$VERSION"
+      - name: The image's digest
+        id: image
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          digest=$(docker buildx imagetools inspect "ghcr.io/bitbytelabio/kitsune-server:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $VERSION"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest the image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/bitbytelabio/kitsune-server
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          # A storage record needs the artifact-metadata permission and adds
+          # nothing that `gh attestation verify` reads.
+          create-storage-record: false
 
   publish:
     needs: [prepare, desktop, server-merge]
@@ -239,6 +304,17 @@ jobs:
             '{version: $version, notes: $notes, pub_date: $date,
               platforms: {"darwin-aarch64": {signature: $signature, url: $url}}}' > latest.json
           gh release upload "$TAG" latest.json --clobber
+      - name: Checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          mkdir assets
+          gh release download "$TAG" --dir assets
+          rm -f assets/SHA256SUMS
+          (cd assets && sha256sum -- * > ../SHA256SUMS)
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
